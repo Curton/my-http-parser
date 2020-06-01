@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"regexp"
 	"strconv"
+	"sync"
 )
 
 type Header struct {
@@ -324,7 +325,6 @@ func getTokenToEol(buf *[]byte, token *[]byte, ret *int) *[]byte {
 
 	bufIndex := 0
 	bufEndIndex := len(*buf)
-	//bufEndIndex := bufLen - 1
 
 	for bufEndIndex-bufIndex >= 8 {
 		{
@@ -551,12 +551,20 @@ func HttpRequestHandler(bufCh chan *[]byte, resultCh chan *HttpRequest) {
 	var postHttpRequest HttpRequest
 	lastRemainBuf := bytes.Buffer{}
 	lastInvalid := false
+
 	for {
 		// read new data from channel
 		var buf *[]byte
 
+		// check if read new data from bufCh
 		if lastRemainBuf.Len() == 0 || lastInvalid {
 			buf = <-bufCh
+			if lastRemainBuf.Len() != 0 {
+				// attach with last remain
+				tmp := lastRemainBuf.Bytes()
+				tmp = append(tmp, *buf...)
+				buf = &tmp
+			}
 			lastInvalid = false
 		} else if waitPostBody {
 			buf = <-bufCh
@@ -565,7 +573,6 @@ func HttpRequestHandler(bufCh chan *[]byte, resultCh chan *HttpRequest) {
 			tmp = append(tmp, *buf...)
 			buf = &tmp
 		} else {
-			// no new data
 			// process last remain
 			tmp := lastRemainBuf.Bytes()
 			buf = &tmp
@@ -627,42 +634,43 @@ func HttpRequestHandler(bufCh chan *[]byte, resultCh chan *HttpRequest) {
 					Body:    nil,
 				}
 				// get Content-Length
+				isInvalidPost := false
 				for _, q := range headers {
 					if bytes.Equal(q.name, []byte("Content-Length")) {
 						contentLen, err := strconv.ParseUint(string(q.value), 10, 64)
 						// err in process Content-Length or ~ == 0
-						if err != nil || contentLen == 0 {
-							// ignore Body, send request header
+						if err != nil || contentLen == 0 || contentLen > 1<<10 {
+							// no actual body, ignore Body, send request header
 							resultCh <- &postHttpRequest
-							lastRemainBuf.Reset()
+							isInvalidPost = true
+							break
 						}
 						waitToBodyLen = contentLen
 						break
 					}
 				}
-				//// contentLen not found
-				//if waitToBodyLen == 0 {
-				//	// ignore Body, send request header
-				//	resultCh <- postHttpRequest
-				//	lastRemainBuf.Reset()
-				//}
-				// body finished,  write body
-				remainLen := uint64(len(*buf) - processed)
 
-				if remainLen == waitToBodyLen {
-					postHttpRequest.Body = (*buf)[processed:]
-					resultCh <- &postHttpRequest
-					lastRemainBuf.Reset()
-				} else if remainLen >= waitToBodyLen {
-					postHttpRequest.Body = (*buf)[processed : processed+int(waitToBodyLen)]
-					resultCh <- &postHttpRequest
-					lastRemainBuf.Reset()
-					lastRemainBuf.Write((*buf)[processed+int(waitToBodyLen):])
-				} else {
-					// wait Body
-					waitPostBody = true
+				if isInvalidPost {
 					lastRemainBuf.Reset()
 					lastRemainBuf.Write((*buf)[processed:])
+				} else {
+					remainLen := uint64(len(*buf) - processed)
+
+					if remainLen == waitToBodyLen {
+						postHttpRequest.Body = (*buf)[processed:]
+						resultCh <- &postHttpRequest
+						lastRemainBuf.Reset()
+					} else if remainLen >= waitToBodyLen {
+						postHttpRequest.Body = (*buf)[processed : processed+int(waitToBodyLen)]
+						resultCh <- &postHttpRequest
+						lastRemainBuf.Reset()
+						lastRemainBuf.Write((*buf)[processed+int(waitToBodyLen):])
+					} else {
+						// wait Body
+						waitPostBody = true
+						lastRemainBuf.Reset()
+						lastRemainBuf.Write((*buf)[processed:])
+					}
 				}
 
 			}
@@ -675,4 +683,54 @@ func HttpRequestHandler(bufCh chan *[]byte, resultCh chan *HttpRequest) {
 		}
 	}
 
+}
+
+type httpRequestListNode struct {
+	value *HttpRequest
+	next  *httpRequestListNode
+}
+
+type HttpRequestLinkedList struct {
+	current *httpRequestListNode
+	mux     sync.Mutex
+}
+
+func (l *HttpRequestLinkedList) Read() *HttpRequest {
+	l.mux.Lock()
+	defer l.mux.Unlock()
+	if l.current != nil {
+		ret := l.current.value
+		l.current = l.current.next
+		return ret
+	} else {
+		return nil
+	}
+}
+
+func (l *HttpRequestLinkedList) Reset() {
+	l.mux.Lock()
+	defer l.mux.Unlock()
+	l.current = nil
+}
+
+// ordered and blocking way to process request
+func ApplyRequestLinkedList(list *HttpRequestLinkedList, resultCh chan *HttpRequest, quit chan bool) {
+	go func() {
+
+		for {
+			select {
+			case result := <-resultCh:
+				// write to list
+				list.mux.Lock()
+				current := list.current
+				for current != nil {
+					current = current.next
+				}
+				current = &httpRequestListNode{value: result}
+				list.mux.Unlock()
+			case <-quit:
+				return
+			}
+		}
+	}()
 }
