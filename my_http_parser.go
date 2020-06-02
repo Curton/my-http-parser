@@ -522,12 +522,32 @@ type HttpRequest struct {
 	headersMap map[string][]byte
 }
 
-func (r *HttpRequest) FindQueries(str string) []byte {
+func (r *HttpRequest) FindQuery(str string) []byte {
+	if r.queriesMap != nil {
+		return r.queriesMap[str]
+	}
+	for _, v := range r.Queries {
+		if bytes.Equal(v.key, []byte(str)) {
+			return v.value
+		}
+	}
 	return nil
 }
 
-// using map while size > 10 for quick look up
-func (r *HttpRequest) initMap() {
+func (r *HttpRequest) FindHeader(str string) []byte {
+	if r.headersMap != nil {
+		return r.headersMap[str]
+	}
+	for _, v := range r.Headers {
+		if bytes.Equal(v.name, []byte(str)) {
+			return v.value
+		}
+	}
+	return nil
+}
+
+// using map while size > 16 for quick look up
+func (r *HttpRequest) init() *HttpRequest {
 	qLen := len(r.Queries)
 	hLen := len(r.Headers)
 	if qLen > 10 {
@@ -542,13 +562,15 @@ func (r *HttpRequest) initMap() {
 			r.headersMap[string(r.Headers[i].name)] = r.Headers[i].value
 		}
 	}
+
+	return r
 }
 
 // should run in goroutine
 func HttpRequestHandler(bufCh chan *[]byte, resultCh chan *HttpRequest) {
 	waitPostBody := false
 	var waitToBodyLen uint64
-	var postHttpRequest HttpRequest
+	var waitPostBodyHttpRequest HttpRequest
 	lastRemainBuf := bytes.Buffer{}
 	lastInvalid := false
 
@@ -580,52 +602,59 @@ func HttpRequestHandler(bufCh chan *[]byte, resultCh chan *HttpRequest) {
 
 		if waitPostBody {
 			if uint64(len(*buf)) >= waitToBodyLen {
-				postHttpRequest.Body = (*buf)[:waitToBodyLen]
-				resultCh <- &postHttpRequest
+				waitPostBodyHttpRequest.Body = (*buf)[:waitToBodyLen]
+				resultCh <- waitPostBodyHttpRequest.init()
 				waitPostBody = false
 				lastRemainBuf.Reset()
 				lastRemainBuf.Write((*buf)[waitToBodyLen:])
+				continue
 			} else {
 				// continue to wait for data
 				// write back data to buf
+				lastRemainBuf.Reset()
 				lastRemainBuf.Write(*buf)
+				continue
 			}
 		}
 
 		// new request
-		var method []byte
-		var path []byte
+		method := make([]byte, 0, 1<<2)
+		path := make([]byte, 0, 1<<3)
 		var minorVersion int
 		headers := make([]Header, 0, 1<<5)
 		queries := make([]Query, 0, 1<<5)
 		//request := HttpRequest{}
 
-		processed := ParseRequest(buf, &method, &path, &queries, &minorVersion, &headers)
+		buf2 := make([]byte, len(*buf))
+		copy(buf2, *buf)
+		processed := ParseRequest(&buf2, &method, &path, &queries, &minorVersion, &headers)
 
 		if processed > 0 {
 
 			// GET request
 			if bytes.Equal(method, []byte("GET")) {
 				ver := "HTTP/1." + strconv.Itoa(minorVersion)
-				resultCh <- &HttpRequest{
+
+				resultCh <- (&HttpRequest{
 					Method:  method,
 					Path:    path,
 					Queries: queries,
 					Version: []byte(ver),
 					Headers: headers,
 					Body:    nil,
-				}
+				}).init()
 				if len(*buf) == processed {
 					lastRemainBuf.Reset()
 				} else {
 					lastRemainBuf.Reset()
 					lastRemainBuf.Write((*buf)[processed:])
 				}
+				lastInvalid = false
 			}
 			// POST request
 			if bytes.Equal(method, []byte("POST")) {
 				ver := "HTTP/1." + strconv.Itoa(minorVersion)
-				postHttpRequest = HttpRequest{
+				var postHttpRequest = HttpRequest{
 					Method:  method,
 					Path:    path,
 					Queries: queries,
@@ -635,14 +664,15 @@ func HttpRequestHandler(bufCh chan *[]byte, resultCh chan *HttpRequest) {
 				}
 				// get Content-Length
 				isInvalidPost := false
+				waitToBodyLen = 0
 				for _, q := range headers {
 					if bytes.Equal(q.name, []byte("Content-Length")) {
 						contentLen, err := strconv.ParseUint(string(q.value), 10, 64)
 						// err in process Content-Length or ~ == 0
 						if err != nil || contentLen == 0 || contentLen > 1<<10 {
-							// no actual body, ignore Body, send request header
-							resultCh <- &postHttpRequest
 							isInvalidPost = true
+							lastInvalid = true
+							//waitToBodyLen = 0
 							break
 						}
 						waitToBodyLen = contentLen
@@ -650,26 +680,35 @@ func HttpRequestHandler(bufCh chan *[]byte, resultCh chan *HttpRequest) {
 					}
 				}
 
-				if isInvalidPost {
+				// no declared Content-Length or invalid content length
+				if waitToBodyLen == 0 {
+					resultCh <- postHttpRequest.init()
+					lastRemainBuf.Reset()
+					lastRemainBuf.Write((*buf)[processed:])
+				} else if isInvalidPost {
+					// declared Content-Length too long
 					lastRemainBuf.Reset()
 					lastRemainBuf.Write((*buf)[processed:])
 				} else {
+					// valid post
 					remainLen := uint64(len(*buf) - processed)
-
 					if remainLen == waitToBodyLen {
 						postHttpRequest.Body = (*buf)[processed:]
-						resultCh <- &postHttpRequest
+						resultCh <- postHttpRequest.init()
 						lastRemainBuf.Reset()
+						lastInvalid = false
 					} else if remainLen >= waitToBodyLen {
 						postHttpRequest.Body = (*buf)[processed : processed+int(waitToBodyLen)]
-						resultCh <- &postHttpRequest
+						resultCh <- postHttpRequest.init()
 						lastRemainBuf.Reset()
 						lastRemainBuf.Write((*buf)[processed+int(waitToBodyLen):])
+						lastInvalid = false
 					} else {
 						// wait Body
 						waitPostBody = true
 						lastRemainBuf.Reset()
 						lastRemainBuf.Write((*buf)[processed:])
+						waitPostBodyHttpRequest = postHttpRequest
 					}
 				}
 
