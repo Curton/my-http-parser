@@ -1,3 +1,3 @@
 # Go http-parser
 
-## Simple http parser written in Go
+Simple http parser written in Go
